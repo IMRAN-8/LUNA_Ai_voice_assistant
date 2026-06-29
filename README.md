@@ -19,6 +19,11 @@ The goal of this project is to connect **IoT hardware** with **AI services** and
 •	Designed for IoT and embedded AI experiments
 
 ```
+## Preview
+
+>
+> ![Luna Project Image](assets/Project.jpeg)
+>
 
 ## How It Works
 
