@@ -1,4 +1,4 @@
-# Luna AI
+# Luna AI v1.1
 
 Luna AI is an ESP32-based AI voice assistant powered by a Node.js backend.  
 The ESP32 records the user's voice and sends it into text, think using AI, remember useful information, and reply back with voice.
