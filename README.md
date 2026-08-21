@@ -150,16 +150,13 @@ Pin map and wiring: [`docs/HARDWARE.md`](docs/HARDWARE.md)
 
 ---
 
-## Roadmap
-
-- [ ] Wi-Fi reconnect with request retry
-- [ ] OTA firmware updates over Wi-Fi
-- [ ] Battery power (18650 + TP4056 + boost) with voltage monitoring
-- [ ] Custom "Hey Luna" wake word
-- [ ] On-device noise suppression via the ESP-SR AFE
-
----
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+```
+Author : 
+Imran Hosen
+```
+GitHub: https://github.com/IMRAN-8
+```
