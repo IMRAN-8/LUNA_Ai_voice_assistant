@@ -153,7 +153,7 @@ Pin map and wiring: [`docs/HARDWARE.md`](docs/HARDWARE.md)
 ## License
 
 MIT — see [LICENSE](LICENSE).
----
+
 Author : 
 Imran Hosen
 ```
