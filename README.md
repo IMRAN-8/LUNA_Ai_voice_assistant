@@ -40,7 +40,12 @@ v2.0 is a full rebuild on the ESP32-S3.
 - **Graceful degradation** — falls back to STT/chat/TTS if the fast path fails
 
 ---
+## Preview
 
+>
+> ![Luna ESP32-S3 AI voice assistant](docs/images/luna_v2.0.jpg)
+>
+---
 ## System overview
 
 ```
