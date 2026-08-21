@@ -1,254 +1,5 @@
 // ====================================================================
-//  Luna ESP32-S3 AI Voice Assistant — v10  (AUDIO OVERHAUL)
-//
-//  WHY THIS VERSION EXISTS
-//  Reported: speech weak/unclear at ~1 m, must sit close to the mic,
-//  captured speech too quiet, VAD poorly tuned, tuning values scattered
-//  and hard to change.
-//
-//  MEASURED ROOT CAUSES (from your own serial logs, not guesswork)
-//   1. UNDER-GAIN, ~20.8 dB of headroom wasted.
-//      Logged speech peakRMS 506..1215 in the REC path implies a peak
-//      sample of only ~2988 of 32767 -- 9.1% of the 16-bit range. The
-//      microphone was never the bottleneck; the firmware was.
-//   2. RESOLUTION THROWN AWAY BEFORE THE GAIN.
-//      v9.x did (W >> 11) * 1.6 -- an INTEGER shift, then a float
-//      multiply, discarding 3 bits first. And shift+gain are
-//      mathematically redundant, so there were two interacting knobs
-//      for one quantity.
-//   3. *** THE VAD COUPLING BUG *** (this is why raising gain always
-//      backfired before). The gate rails were ABSOLUTE int16 constants
-//      (150 / 700). Raise micGain and the measured noise floor scales
-//      with it, but the rails do not -- so the gate saturates at 700
-//      and speech detection silently breaks.
-//        micGain 1.0 -> floor 232, gate 441   OK
-//        micGain 2.0 -> floor 464, gate 700   RAILED (wanted 882)
-//        micGain 3.0 -> floor 696, gate 700   RAILED (wanted 1322)
-//
-//  WHAT v10 CHANGES
-//   * ONE gain knob, applied in float from the FULL 24-bit sample.
-//     micGain 1.0 == v9.9 exactly, so it is a plain "times louder".
-//   * Every VAD rail is now scaled by micGain -- gain and detection
-//     move together and the tuning stays valid at any gain.
-//   * All tuning lives in one AudioConfig struct. Nothing is scattered.
-//   * Runtime console: `help`, `status`, `meter`, `calibrate`, `test`,
-//     `gain 2.5`, `silence 900`, ... plus `save` to NVS.
-//   * Built-in guided distance test (quiet / 20cm / 50cm / 1m) that
-//     reports RMS, peak, SNR, clipping and a suggested gain.
-//
-//  NOT CHANGED: OLED eyes, text display, button, STT, chat, memory mode,
-//  TTS, playback, server protocol, pin map, PSRAM buffers, dual-core.
-//
-//  v9.7 — low latency: streaming playback ring + /api/converse fast path.
-//  v9.6 — network reliability: TLS released per turn, retries, and
-//         "Network error" shown separately from "No speech".
-//  v9.5 — robust endpointing: non-speech-mean noise tracker + dual-gate
-//         safety counter so silence detection cannot silently fail.
-//  v9.4 — adaptive VAD, speaker TX primed with silence at boot.
-//  v9.3 — endpointing: pre-roll ring buffer, hysteresis, trailing trim.
-//  v9.2 — Core 0 contention: I2C 400 kHz, Wi-Fi modem sleep off, 'v' toggle.
-//  v9.7 — low latency: streaming playback ring + /api/converse fast path.
-//  v9.6 — network reliability: TLS released per turn, retries, and
-//         "Network error" shown separately from "No speech".
-//  v9.5 — robust endpointing: non-speech-mean noise tracker + dual-gate
-//         safety counter so silence detection cannot silently fail.
-//  v9.4 — adaptive VAD, speaker TX primed with silence at boot.
-//  v9.3 — endpointing: pre-roll ring buffer, hysteresis, trailing trim.
-//  v9.2 — Core 0 contention: I2C 400 kHz, Wi-Fi modem sleep off, 'v' toggle.
-//
-//  NEW IN v9.7 — TWO CHANGES THAT ATTACK THE 4-5 s ROUND TRIP
-//
-//  1. STREAMING PLAYBACK (was: download everything, then play)
-//     v9.6 pulled the whole clip into PSRAM before a single sample played.
-//     That fixed the buzzing but added the entire download to perceived
-//     latency -- 400 KB at ~150 KB/s is 2.7 s of silence before Luna
-//     speaks. v9.7 uses a 256 KB PSRAM ring with a producer/consumer split:
-//         producer  this task, Core 1, pulling from TLS
-//         consumer  ttsPlayTask, Core 0, priority 6, feeding I2S
-//     Audio starts after a 32 KB (~1.0 s) pre-buffer and the rest streams
-//     in behind it. The pre-buffer is what keeps the anti-buzz guarantee;
-//     underruns are counted and logged if it ever runs dry.
-//
-//  2. ONE ROUND TRIP INSTEAD OF THREE  (server v3 /api/converse)
-//     Old: upload -> Whisper -> gpt-4o-mini -> gTTS -> ffmpeg -> download.
-//     New: upload -> gpt-audio-mini (audio in, audio out) -> download.
-//     The reply text arrives in the X-Reply header BEFORE the body, so the
-//     OLED starts typing at the same moment audio starts.
-//     Set USE_CONVERSE 0 to force the legacy path; it is also used
-//     automatically if /api/converse fails, so a server problem degrades
-//     instead of breaking.
-//
-//     Memory mode still runs on the legacy text endpoints, because
-//     judgeFact needs a transcript and an audio model never returns the
-//     user's own words. The server handles that by running Whisper in
-//     PARALLEL purely for command detection.
-//
-//  REQUIRES server.js v3 deployed.
-//
-//  v9.6 — network reliability: TLS released per turn, retries, and
-//         "Network error" shown separately from "No speech".
-//  v9.5 — robust endpointing: non-speech-mean noise tracker + dual-gate
-//         safety counter so silence detection cannot silently fail.
-//  v9.4 — adaptive VAD, speaker TX primed with silence at boot.
-//  v9.3 — endpointing: pre-roll ring buffer, hysteresis, trailing trim.
-//  v9.2 — Core 0 contention: I2C 400 kHz, Wi-Fi modem sleep off, 'v' toggle.
-//
-//  NEW IN v9.6 — FIXES "SOMETIMES IT CANNOT DETECT WHAT I'M ASKING"
-//    Endpointing works as of v9.5 (silenceStop=1 on every wake turn).
-//    The remaining failures were NETWORK, not audio:
-//
-//      [stt] code=-7  no HTTP server      3 of 9 uploads failed
-//
-//    And the correlation was exact -- every -7 followed a round that ended
-//    at ~73.4 KB heap, while every success followed one ending at ~85.5 KB.
-//    http.setReuse(true) kept the TLS session (~50 KB of buffers) alive
-//    between turns; at 73 KB there was not enough contiguous heap left for
-//    the next handshake. Heap jumped to 126 KB right after each failure,
-//    which is the session finally being torn down.
-//
-//    Fixes:
-//      * setReuse(false) everywhere, and netReset() (http.end +
-//        tlsClient.stop) after every request and at the end of every turn.
-//      * sendSTT() and chat() retry once after a clean reconnect.
-//      * NEW: a failed upload now shows "Network error" on the OLED.
-//        v9.5 showed "No speech" for both cases, so a 33% HTTP failure
-//        rate looked exactly like Luna not hearing you.
-//
-//  v9.5 — robust endpointing: non-speech-mean noise tracker + dual-gate
-//         safety counter so silence detection cannot silently fail.
-//  v9.4 — adaptive VAD, speaker TX primed with silence at boot.
-//  v9.3 — endpointing: pre-roll ring buffer, hysteresis, trailing trim.
-//  v9.2 — Core 0 contention: I2C 400 kHz, Wi-Fi modem sleep off, 'v' toggle.
-//
-//  NEW IN v9.5 — SILENCE DETECTION THAT CANNOT SILENTLY FAIL
-//    v9.4 symptom: after the wake word it listened for the full 15 s no
-//    matter what, then reported nothing heard.
-//    v9.4 log:  speech start rms=203 noise=73 gate=161 cont=88
-//               hit max length ... speech=1 silenceStop=0
-//
-//    Two bugs, both mine:
-//      a) The tracker chased the QUIETEST FRAME (fall coefficient 0.30),
-//         settling at 73 in a room whose real floor is ~250. It now tracks
-//         the MEAN OF NON-SPEECH FRAMES, so speech and one-off quiet frames
-//         cannot drag it.
-//      b) cont was only 1.21x the floor, i.e. BELOW the room noise, so
-//         "frame is silent" was never true and the recorder ran to the
-//         15 s cap. cont is now 1.33x and, crucially, no longer the only
-//         way to stop.
-//
-//    NEW SAFETY NET: two independent silence counters run in parallel.
-//      contGate  (sensitive) -> endpoint after END_SILENCE_MS      (0.8 s)
-//      startGate (higher)    -> endpoint after 1.5x that           (1.2 s)
-//    The second one uses the higher threshold, so even if the adaptive
-//    floor is wrong and contGate lands under the room noise, recording
-//    still stops within ~1.2 s of you finishing. The run-to-15-s failure
-//    is now structurally impossible.
-//
-//  v9.4 — adaptive VAD, speaker TX primed with silence at boot.
-//  v9.3 — endpointing: pre-roll ring buffer, hysteresis, trailing trim.
-//  v9.2 — Core 0 contention: I2C 400 kHz, Wi-Fi modem sleep off, 'v' toggle.
-//
-//  NEW IN v9.4 — THE GATE IS NO LONGER TRUSTED TO BOOT CALIBRATION
-//    v9.3 measured a "quiet room" floor of 1377 and set the VAD gate to
-//    1440, while real speech peaks at 700-1000. Nothing ever crossed it,
-//    so every wake-word turn logged "nobody spoke". Boot calibration has
-//    now been wrong three revisions in a row, so it has been demoted to a
-//    seed and a diagnostic.
-//
-//    The gate is now tracked LIVE while Luna waits for you to speak:
-//      floor falls fast (0.30) toward the true room level,
-//      rises very slowly (0.003) so your voice cannot inflate it,
-//      gate = floor x 2.2, hard-railed to 150..550.
-//    It converges in about 100 ms and self-corrects in any room.
-//
-//    Also: the speaker's TX DMA is primed with silence at boot. An enabled
-//    MAX98357A with an un-primed buffer emits switching noise that the
-//    adjacent mic hears -- a likely reason the boot floor read so high,
-//    since v8 never had the speaker live during mic calibration.
-//
-//  v9.3 — endpointing: pre-roll ring buffer, hysteresis, trailing trim.
-//  v9.2 — Core 0 contention: I2C 400 kHz, Wi-Fi modem sleep off, 'v' toggle.
-//
-//  NEW IN v9.3 — SILENCE DETECTION / ENDPOINTING
-//    Say "Hi ESP", then take your time. Luna waits (up to WAKE_WAIT_MS)
-//    without recording anything, starts the moment you speak, and stops
-//    ~END_SILENCE_MS after you finish.
-//
-//      wake word -> [waiting, nothing recorded] -> you talk -> [recording]
-//                                               -> you stop -> 0.8 s -> send
-//
-//    * PRE-ROLL RING BUFFER. While waiting, audio circulates through a
-//      300 ms buffer. On speech onset it is flushed into the clip first,
-//      so the opening consonant is never clipped. Nothing else touches the
-//      main buffer, so MAX_RECORD_SECONDS now applies to SPEECH ONLY --
-//      which is why the 10 s limit could be raised to 15 s.
-//    * HYSTERESIS. Full gate to START speech, 55% of it to STAY in speech.
-//      Quiet trailing sounds and short between-word gaps no longer end the
-//      recording early.
-//    * TRAILING TRIM. Silence beyond 250 ms is cut before upload: smaller
-//      WAV, faster reply, and fewer Whisper "Thank you." hallucinations.
-//    * 'e' serial command tunes end-of-speech silence live.
-//
-//  v9.2 — Core 0 contention: I2C 100k -> 400k, Wi-Fi modem sleep off,
-//         'v' toggles the OLED so wake-rate can be A/B tested.
-//
-//  FIXED IN v9.1  (from serial-log analysis of v9.0)
-//    1. BOOT LOOP. esp-sr's MultiNet FST builder crashes on a one-entry
-//       command list (StoreProhibited, EXCVADDR 0xfffffffc). Restored to
-//       two entries. Do not trim it again.
-//    2. CALIBRATION SATURATED EVERY BOOT. primeDc() ran BEFORE the flush,
-//       so it seeded the DC estimate from I2S startup garbage
-//       (p12=5109, median=15594, max=32732 on all 22 boots). Order is now
-//       flush -> prime -> flush, with one retry.
-//    3. RECORDING CUT OFF AT 2.5 s. The saturated calibration forced a
-//       fallback floor of 480, giving a VAD gate of 600 that speech
-//       (peakRMS median 718) could not reliably cross -- 0/5 turns ever
-//       latched, so the wake-mode timeout fired every time. Floor,
-//       fallback and gate limits retuned; timeout raised 2.5 s -> 5 s.
-//    4. BUZZING ON PLAYBACK. Heap falls to ~74 KB with ESP-SR resident and
-//       ESP_I2S has smaller TX DMA buffers than v8's legacy config, so TLS
-//       stalls starved the DMA. TTS is now downloaded fully into PSRAM
-//       before playback, and the mic bus is torn down during playback
-//       exactly as v8 did (see STOP_MIC_DURING_TTS).
-//
-//  NEW IN v9
-//    * Offline wake word "Hi ESP" via ESP-SR WakeNet9 (no cloud, no button)
-//    * Button still works as a parallel trigger / fallback
-//    * Ported from legacy driver/i2s.h to ESP_I2S (required by ESP_SR)
-//    * Mic and speaker now run on separate I2S peripherals SIMULTANEOUSLY.
-//      The old install/uninstall dance on every turn is gone.
-//
-//  UNCHANGED FROM v8 (carried over verbatim)
-//    Animated eyes, OLED typing, display task, WAV builder, Whisper STT,
-//    chat, memory mode, and the entire server.js. Nothing to redeploy.
-//
-//  ---------------- TUNING, MEASURED ON YOUR HARDWARE ----------------
-//  Two mic profiles, switched at runtime:
-//
-//    WAKE  shift 7,  gain 1.0   -> feeds WakeNet
-//          Chosen from your s7/s8/s9 sweep: median speech RMS 968,
-//          crest 4-5x, zero clipping, most detections.
-//
-//    REC   shift 11, gain 1.6   -> feeds Whisper
-//          Identical maths to v8's MIC_RAW_SHIFT 11 + fixedGain 1.6,
-//          so transcription accuracy is unchanged.
-//
-//  A soft limiter replaces v8's hard constrain(): transients compress
-//  instead of squaring off. Switching profiles rescales the DC filter
-//  state so there is no settling transient (that was the phantom
-//  peak=32767 you saw at boot).
-//  --------------------------------------------------------------
-//  ARDUINO IDE SETTINGS  (esp32 core 3.3.11)
-//    Board            : ESP32S3 Dev Module
-//    PSRAM            : OPI PSRAM          <-- required
-//    Partition Scheme : ESP SR 16M         <-- required, holds srmodels.bin
-//    Flash Size       : 16MB (128Mb)
-//    USB CDC On Boot  : Enabled            <-- what fixed your serial
-//    CPU Frequency    : 240MHz
-//  --------------------------------------------------------------
-//  SERIAL COMMANDS (live tuning, no reflash)
-//    s7 / s8 ...  wake-profile shift        g1.0  wake-profile gain
-//    ?            show settings             d     detection stats
+//  Luna ESP32-S3 AI Voice Assistant — v10
 // ====================================================================
 
 #include <WiFi.h>
@@ -305,28 +56,7 @@ Adafruit_SH1106G display(128, 64, &Wire, -1);
 #define MAX_SAMPLES        (SAMPLE_RATE * MAX_RECORD_SECONDS)
 #define MAX_WAV_SIZE       (44 + MAX_SAMPLES * 2)
 
-// ====================================================================
-//            *****  CENTRAL AUDIO CONFIGURATION  *****
-//   Everything tunable lives in AudioConfig below. Nothing audio-related
-//   is hardcoded elsewhere. All values are runtime-adjustable over
-//   Serial (`help`) and persist to NVS with `save`.
-// ====================================================================
 
-// ---- How a raw I2S word becomes an int16 sample --------------------
-// The INMP441 emits 24-bit signed data LEFT-JUSTIFIED in a 32-bit slot,
-// so the raw word W = S << 8, where S is the true 24-bit value.
-//
-// v9.x did:  (W >> 11) * 1.6  -- an INTEGER shift, THEN a float multiply.
-// That discarded 3 bits of resolution before the multiply, and split the
-// gain across two interacting knobs (shift + gain) that are
-// mathematically redundant and confusing to tune.
-//
-// v10 recovers the full 24-bit value first, then applies ONE float gain:
-//        out = (W >> 8) * MIC_UNITY_SCALE * micGain
-//
-// MIC_UNITY_SCALE is chosen so micGain = 1.0 reproduces v9.9 EXACTLY
-// (>>11 x 1.6 == S x 0.2). micGain is therefore a plain "times louder
-// than v9.9" multiplier, and no resolution is lost on the way.
 #define MIC_UNITY_SCALE   0.2f      // micGain 1.0 == legacy (>>11 x 1.6)
 #define FULL_SCALE        32767.0f
 
@@ -383,13 +113,7 @@ AudioConfig cfg = {
   /* normOn        */ false
 };
 
-// ---- THE FIX FOR THE VAD COUPLING BUG ------------------------------
-// v9.9 hardcoded the gate rails as ABSOLUTE int16 numbers (150 / 700).
-// When micGain rose, the measured noise floor rose with it but the rails
-// did NOT, so the gate saturated at 700 and speech detection silently
-// broke. That is why every previous attempt to raise gain made things
-// worse. Every rail is now scaled by micGain so the whole VAD moves
-// together and the tuning stays valid at any gain.
+
 static inline float gateMinNow()  { return cfg.gateFloorMin * cfg.micGain; }
 static inline float gateMaxNow()  { return cfg.gateFloorMax * cfg.micGain; }
 static inline float noiseMinNow() { return  40.0f * cfg.micGain; }
@@ -409,34 +133,10 @@ static inline float limitKneeNow(){ return cfg.limitKnee * FULL_SCALE; }
 #define CAL_FLOOR_MAX      (1200.0f * cfg.micGain)
 #define CAL_FLOOR_FALLBACK (140.0f * cfg.micGain)
 #define GATE_MULT       1.35f
-
-// v8 tore down the mic driver inside speak(). Keeping mic RX DMA alive
-// during TTS causes bus/IRQ contention on the MAX98357A that shows up as
-// buzzing. Set to 0 to A/B test it.
 #define STOP_MIC_DURING_TTS 1
-
-// ---------------- STREAMING PLAYBACK ----------------
-// v9.6 downloaded the ENTIRE clip into PSRAM before a single sample played.
-// That killed the buzzing but added the whole download time to perceived
-// latency (400 KB at ~150 KB/s = 2.7 s of silence before Luna speaks).
-//
-// v9.7 uses a PSRAM ring buffer with a producer/consumer split:
-//   producer = this task on Core 1, pulling from TLS
-//   consumer = ttsPlayTask on Core 0, feeding I2S
-// Playback starts once TTS_PREBUFFER is in the ring, and the rest streams
-// in behind it. The pre-buffer is the anti-underrun guarantee.
 #define TTS_RING_SIZE  (256 * 1024)
-// Measured: the TLS download runs at ~30 KB/s while playback consumes
-// ~31.2 KB/s, so the ring can only ever drain. A 32 KB cushion covered
-// ~5 s of audio on a weak link, and replies can be 12 s. 64 KB doubles the
-// margin at the cost of ~0.5 s extra time-to-first-audio.
 #define TTS_PREBUFFER  (64 * 1024)      // ~2.0 s of audio
-// Once the ring HAS run dry, wait for this much again before resuming, so a
-// weak link produces one short gap instead of continuous stutter.
 #define TTS_REBUFFER   (16 * 1024)      // ~0.5 s of audio
-
-// Fast path: one call to /api/converse (audio in -> audio out) instead of
-// STT + chat + TTS. Set to 0 to fall back to the three-call pipeline.
 #define USE_CONVERSE 1
 
 uint8_t* wavBuffer = nullptr;
@@ -444,8 +144,6 @@ uint8_t* ttsRing   = nullptr;   // streaming playback ring (PSRAM)
 int16_t* preroll   = nullptr;   // circular pre-speech buffer, PREROLL_SAMPLES
 int16_t* pcm       = nullptr;
 
-// Ring state. Absolute byte counters: used = ringW - ringR. Single producer
-// (network, Core 1) and single consumer (I2S, Core 0), so no lock needed.
 volatile size_t   ringW = 0, ringR = 0;
 volatile bool     ringEof = false, playDone = true;
 volatile uint32_t underruns = 0;
@@ -471,21 +169,13 @@ Preferences prefs;
 WiFiClientSecure tlsClient;
 HTTPClient       http;
 
-// ====================================================================
-//  GainI2S — ESP_SR pulls audio through the virtual readBytes(), so all
-//  scaling happens here. The bus stays raw 32-bit; we emit scaled 16-bit.
-//  Used for BOTH the wake-word feed and our own recording.
-// ====================================================================
 class GainI2S : public I2SClass {
 public:
   using I2SClass::I2SClass;
 
-  // ONE gain, applied in float from the FULL 24-bit value. v9.x used an
-  // integer shift first, which threw away 3 bits before the multiply.
   volatile float gain    = 1.0f;      // multiples of MIC_UNITY_SCALE
   volatile bool  limiter = true;
 
-  // ---- live measurements, read by `status` / `meter` ----
   volatile float    liveRms    = 0.0f;   // RMS of the last block
   volatile float    livePeak   = 0.0f;   // |peak| of the last block
   volatile int32_t  rawPeak24  = 0;      // |peak| of the raw 24-bit value
@@ -498,16 +188,10 @@ public:
   // there is no settling transient after a change.
   void setGain(float newGain) {
     if (newGain <= 0.0f) return;
-    // dc is tracked in the PRE-gain 24-bit domain, so a gain change needs
-    // no rescaling -- another benefit of moving the shift out of the path.
+    
     gain = newGain;
   }
 
-  // Seed the DC estimate from the signal mean instead of letting it crawl
-  // up from zero. Without this the high-pass takes thousands of samples to
-  // settle and the limiter saturates during that window -- which is what
-  // poisoned the noise calibration in v9.x. Only call while ESP-SR is
-  // paused, because it reads the bus directly.
   void primeDc() {
     size_t got = I2SClass::readBytes((char *)rawbuf, RAW_SAMPLES * sizeof(int32_t));
     int n = got / sizeof(int32_t);
@@ -585,16 +269,7 @@ GainI2S  mic(I2S_NUM_1);     // INMP441
 I2SClass spk(I2S_NUM_0);     // MAX98357A
 
 // ================= WAKE WORD =================
-// ---------------------------------------------------------------
-//  DO NOT REDUCE THIS TO A SINGLE COMMAND.
-//  With exactly one command, esp-sr's MultiNet FST builder crashes:
-//     sr_start(): add 1 commands
-//     Build fst from commands.
-//     Guru Meditation Error: Core 1 panic'ed (StoreProhibited)
-//     EXCVADDR: 0xfffffffc        <- index of -1
-//  Two or more entries build the FST fine. We only use the wake word,
-//  so these phrases are just ballast to keep the builder happy.
-// ---------------------------------------------------------------
+
 enum { SR_CMD_HELLO, SR_CMD_STOP };
 static const sr_cmd_t sr_commands[] = {
   {SR_CMD_HELLO, "Hello Luna"},
@@ -608,10 +283,7 @@ volatile bool     wakeFired = false;
 volatile uint32_t wakeCount = 0;
 volatile bool     srRunning = false;
 
-// ---- wake-reliability experiment controls ----
-// esp-sr pins its Feed Task to CORE 0, which also runs the Wi-Fi stack
-// (priority ~23) and our display task. Both can delay the audio feed and
-// make WakeNet miss. These let you A/B test the cause instead of guessing.
+
 volatile bool uiEnabled = true;      // 'v' toggles the OLED animation
 
 #define EYE_TICK_MS 30               // was 25; fewer full-frame I2C writes
@@ -939,19 +611,12 @@ String jsonEscape(String s) {
 // can say "Network error" instead of blaming your voice with "No speech".
 volatile bool netOk = true;
 
-// Fully release the TLS session. http.setReuse(true) keeps the socket and
-// its ~50 KB of TLS buffers alive between turns; at ~73 KB free heap the
-// next handshake then fails with error(-7) "no HTTP server". Dropping the
-// session between turns is what prevents that.
 void netReset() {
   http.end();
   tlsClient.stop();
   delay(120);
 }
 
-// ================= AUDIO INIT =================
-// Both peripherals come up once in setup() and stay up. The ESP32-S3 has
-// two I2S controllers, so v8's uninstall/reinstall on every turn is gone.
 bool audioInit() {
   mic.setTimeout(1000);
   mic.setPins(MIC_BCLK, MIC_LRC, -1 /* no DOUT */, MIC_DIN);
@@ -971,11 +636,6 @@ bool audioInit() {
     Serial.println("[err] spk.begin() failed");
     return false;
   }
-  // Push silence through the speaker immediately. An enabled MAX98357A with
-  // an un-primed TX DMA can emit switching noise, which the mic (sitting
-  // right next to it) hears as a high noise floor -- a likely contributor to
-  // the bogus boot calibration, since v8 never had the speaker running
-  // during mic calibration.
   {
     uint8_t quiet[512];
     memset(quiet, 0, sizeof(quiet));
@@ -1159,10 +819,6 @@ int recordAudio(bool force = false) {
       break;
     }
 
-    // Two independent silence counters. contGate is the sensitive one; the
-    // startGate counter is a SAFETY NET for the exact v9.4 failure, where
-    // contGate landed below the room floor so the sensitive test could
-    // never fire and recording ran to the 15 s limit.
     if (frameRms > contGate)  silentFrames = 0; else silentFrames++;
     if (frameRms > startGate) lowFrames    = 0; else lowFrames++;
 
@@ -1324,12 +980,6 @@ void ttsPlayTask(void *p) {
 
     if (avail == 0 && ringEof) break;          // clean end of clip
 
-    // ---- THE BUZZING FIX ----------------------------------------------
-    // Previously, when the ring ran dry we just vTaskDelay()'d and wrote
-    // NOTHING to I2S. The TX DMA then keeps clocking out its stale buffer
-    // contents over and over, which is the "unclear buzzing" heard whenever
-    // Wi-Fi dips. Feeding real zeros instead turns that into a short, clean
-    // silent gap.
     if (avail == 0) {
       if (!rebuffering) { underruns++; rebuffering = true; }
       spk.write(quiet, sizeof(quiet));
@@ -1352,9 +1002,7 @@ void ttsPlayTask(void *p) {
     memcpy(chunk, ttsRing + off, first);
     if (n > first) memcpy(chunk + first, ttsRing, n - first);
 
-    // Running peak across the WHOLE clip. Per-chunk printing floods the
-    // monitor and only the trailing silence stays visible, so we keep the
-    // max here and report it once in the [tts] done line.
+   
     {
       const int16_t *sm = (const int16_t *)chunk;
       size_t ns = n / 2;
@@ -1492,9 +1140,7 @@ void speak(String text) {
 }
 
 // ================= CONVERSE (fast path) =================
-// One call: WAV up, WAV down. The reply text arrives in the X-Reply header
-// BEFORE the body, so the OLED starts typing exactly as audio starts.
-// Returns false if the call failed, so the caller can use the legacy path.
+
 bool converse(uint8_t *wav, int size, String &replyOut, bool &memoryMode) {
   netOk = false;
   memoryMode = false;
@@ -1542,11 +1188,6 @@ bool converse(uint8_t *wav, int size, String &replyOut, bool &memoryMode) {
 }
 
 // ================= ONE CONVERSATION TURN =================
-// Same flow as v8's loop body. May return early at any point; the caller
-// guarantees ESP-SR is resumed afterwards.
-// Memory capture. Shared by both paths, and it always uses the LEGACY text
-// endpoints: judgeFact needs a transcript, and the audio model never
-// returns the user's own words.
 void memoryModeFlow(bool fromWake) {
   setEyeMood(EYE_HAPPY);
   showStatus("What should I remember?");
@@ -1624,10 +1265,7 @@ void conversationTurn(bool fromWake) {
 
 #if USE_CONVERSE
   // ---------- FAST PATH: one round trip ----------
-  // /api/converse does STT + LLM + TTS in a single upstream call and
-  // streams the audio straight back. converse() puts the reply on the OLED
-  // from the X-Reply header the moment it arrives, so text and speech
-  // start together instead of the screen waiting for the download.
+ 
   {
     String reply;
     bool   memMode = false;
@@ -1666,9 +1304,6 @@ void conversationTurn(bool fromWake) {
   backToEyes();
 }
 
-// Pause wake detection, switch the mic to the Whisper profile, run the
-// turn, then restore. Single place that owns pause/resume so no early
-// return can leave ESP-SR stopped.
 void handleConversation(bool fromWake) {
   if (srRunning) ESP_SR.pause();
   mic.setGain(cfg.micGain);
