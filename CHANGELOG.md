@@ -54,5 +54,5 @@ Full rebuild on the ESP32-S3. The 2-second input limit of v1.1 is gone.
 - Node.js server on Render, kept warm by UptimeRobot
 - Memory add, view, and reset
 
-### Known issues
+### Limitation
 - Voice input limited to 2 seconds
