@@ -1,9 +1,0 @@
-{
-  "name": "luna-server",
-  "version": "1.0.0",
-  "description": "AI voice assistant backend for ESP32",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  }
-}
